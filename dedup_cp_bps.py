@@ -26,6 +26,8 @@ import os
 import re
 import sys
 
+from topond_logging import log_action, log_error, setup
+
 BOHR2ANG = 0.529177210903
 CLUSTER_TOL = 0.05          # Angstrom, consistency of two copies of a cluster table
 
@@ -809,32 +811,62 @@ def main(argv=None):
     ap.add_argument('--report', action='store_true', help='print the detailed report')
     ap.add_argument('--verify', action='store_true',
                     help='check the output against the input and report the problems')
-    args = ap.parse_args(argv)
+    logger = setup('dedup')
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            log_error(logger, 'DED-E006', 'invalid command-line arguments',
+                      argv=' '.join(sys.argv[1:] if argv is None else argv),
+                      exit_code=exc.code)
+        raise
 
     src = args.input
     dst = args.output or (os.path.splitext(src)[0] + '_dedup.out')
+    log_action(logger, 'start', input=src, output=dst,
+               report=args.report, verify=args.verify)
     if os.path.abspath(src) == os.path.abspath(dst):
+        log_error(logger, 'DED-E002',
+                  'the output file must differ from the input file',
+                  input=src, output=dst)
         ap.error('the output file must differ from the input file')
     if not os.path.isfile(src):
+        log_error(logger, 'DED-E001', 'input file not found', input=src)
         ap.error(f'input file not found: {src}')
 
-    lines = load(src)
-    report = collections.OrderedDict()
-    out, lay = build(lines, report)
+    try:
+        lines = load(src)
+        report = collections.OrderedDict()
+        out, lay = build(lines, report)
+    except (OSError, ValueError, KeyError) as exc:
+        log_error(logger, 'DED-E003', 'failed to process input',
+                  exc=exc, input=src)
+        raise
 
-    with open(dst, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(out) + '\n')
+    try:
+        with open(dst, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(out) + '\n')
+    except OSError as exc:
+        log_error(logger, 'DED-E004', 'failed to write output',
+                  exc=exc, output=dst)
+        raise
 
+    log_action(logger, 'written', output=dst, lines=len(out),
+               source_lines=len(lines))
     print(f'written {dst}: {len(out)} lines (source {len(lines)})')
     if args.report:
         for k, v in report.items():
+            logger.info('report %s=%s', k, v)
             print(f'  {k}: {v}')
 
     if args.verify:
         problems = verify(lines, out)
         for p in problems:
+            log_error(logger, 'DED-E005', 'verify problem', detail=p)
             print('PROBLEM:', p)
-        print('RESULT:', 'OK' if not problems else 'PROBLEMS FOUND')
+        result = 'OK' if not problems else 'PROBLEMS FOUND'
+        log_action(logger, 'verify', result=result, problems=len(problems))
+        print('RESULT:', result)
         return 1 if problems else 0
     return 0
 

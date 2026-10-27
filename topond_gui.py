@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import math
 import os
 import queue
@@ -20,7 +21,27 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, font, messagebox, ttk
 
+from topond_logging import (
+    get_logger,
+    install_excepthook,
+    log_action,
+    log_error,
+    log_path,
+    setup,
+)
+
 BASE_DIR = Path(__file__).resolve().parent
+LOGGER = get_logger("gui")
+
+
+def _child_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["TOPOND_GUI_CHILD"] = "1"
+    env["TOPOND_LOG_FILE"] = str(log_path())
+    env.setdefault("TOPOND_LOG_LEVEL", "INFO")
+    return env
 
 
 def _find_script(*relative_paths: str) -> Path:
@@ -37,12 +58,15 @@ DEDUP_SCRIPT = _find_script(
 )
 EXPORT_SCRIPT = BASE_DIR / "topond_cp_export.py"
 SUPERCELL_SCRIPT = BASE_DIR / "make_supercell.py"
+VIEWER_SCRIPT = BASE_DIR / "topond_jsmol_viewer.py"
 
 WORKER_PYTHON_ENV = "TOPOND_WORKER_PYTHON"
 GUI_PYTHON_ENV = "TOPOND_GUI_PYTHON"
 GUI_REEXEC_ENV = "TOPOND_GUI_REEXEC"
 
 UI_FONT_CANDIDATES = (
+    "Arial",
+    "Segoe UI",
     "Noto Sans",
     "Noto Sans Display",
     "DejaVu Sans",
@@ -50,8 +74,6 @@ UI_FONT_CANDIDATES = (
     "Ubuntu",
     "Ubuntu Sans",
     "Cantarell",
-    "Segoe UI",
-    "Arial",
     "Helvetica Neue",
     "Helvetica",
     "Lucida Grande",
@@ -388,9 +410,7 @@ class ProcessRunner:
     def start(self, command: list[str]) -> None:
         if self.running():
             raise RuntimeError("процесс уже выполняется")
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        env["PYTHONIOENCODING"] = "utf-8"
+        env = _child_env()
         kwargs: dict = {}
         if os.name == "posix":
             kwargs["start_new_session"] = True
@@ -407,6 +427,8 @@ class ProcessRunner:
             env=env,
             **kwargs,
         )
+        log_action(LOGGER, "process_start", pid=self.process.pid,
+                   command=" ".join(command))
         self.thread = threading.Thread(
             target=self._read_output,
             args=(self.process,),
@@ -710,6 +732,7 @@ class App(tk.Tk):
         self._configure_style()
         self._build_ui()
         self._init_defaults()
+        self._bind_ui_logging()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll_events)
 
@@ -1089,15 +1112,19 @@ class App(tk.Tk):
         self.dedup_page = ScrollableTab(self.notebook)
         self.export_page = ScrollableTab(self.notebook)
         self.super_page = ScrollableTab(self.notebook)
+        self.viewer_page = ScrollableTab(self.notebook)
         self.dedup_tab = DedupTab(self.dedup_page.content, self)
         self.export_tab = ExportTab(self.export_page.content, self)
         self.super_tab = SupercellTab(self.super_page.content, self)
+        self.viewer_tab = ViewerTab(self.viewer_page.content, self)
         self.dedup_tab.pack(fill="both", expand=True)
         self.export_tab.pack(fill="both", expand=True)
         self.super_tab.pack(fill="both", expand=True)
+        self.viewer_tab.pack(fill="both", expand=True)
         self.notebook.add(self.dedup_page, text="1. Очистка .out")
         self.notebook.add(self.export_page, text="2. PDB и BPs")
         self.notebook.add(self.super_page, text="3. Суперячейка")
+        self.notebook.add(self.viewer_page, text="4. Просмотр JSmol")
 
         self._build_bottom_panel(outer)
 
@@ -1204,10 +1231,14 @@ class App(tk.Tk):
         results_dir = BASE_DIR / "results"
         if results_dir.is_dir():
             self.super_tab.suggest_indir(str(results_dir))
+            self.viewer_tab.set_directory(str(results_dir), announce=False)
             self.last_output_dir = results_dir
             self.open_button.state(["!disabled"])
         else:
             self.super_tab.suggest_indir(self.export_tab.outdir_var.get())
+            export_dir = self.export_tab.outdir_var.get().strip()
+            if export_dir:
+                self.viewer_tab.set_directory(export_dir, announce=False)
 
     def register_run_button(self, button: ttk.Button) -> None:
         self.run_buttons.append(button)
@@ -1229,6 +1260,8 @@ class App(tk.Tk):
         try:
             self.runner.start(command)
         except OSError as exc:
+            log_error(LOGGER, "GUI-E002", "failed to launch process", exc=exc,
+                      command=" ".join(command))
             messagebox.showerror(
                 "Не удалось запустить",
                 f"{exc}\n\nКоманда:\n{format_command(command)}",
@@ -1237,6 +1270,7 @@ class App(tk.Tk):
             self._append_log(f"ОШИБКА запуска: {exc}")
             return False
 
+        log_action(LOGGER, "run", title=title, command=" ".join(command))
         self.active_title = title
         self.success_callback = on_success
         self.stop_requested = False
@@ -1299,6 +1333,7 @@ class App(tk.Tk):
         self.stop_button.state(["disabled"])
 
         if code == 0:
+            log_action(LOGGER, "process_done", title=title, code=code)
             self.progress["value"] = 100
             self.status_label.configure(
                 text=f"Готово: {title}",
@@ -1311,6 +1346,7 @@ class App(tk.Tk):
                 except Exception:
                     self._append_log(traceback.format_exc().rstrip())
         elif stopped:
+            log_action(LOGGER, "process_stopped", title=title, code=code)
             self.progress["value"] = 0
             self.status_label.configure(
                 text="Остановлено пользователем",
@@ -1318,6 +1354,8 @@ class App(tk.Tk):
             )
             self._append_log("Процесс остановлен пользователем.")
         else:
+            log_error(LOGGER, "GUI-E005", "process finished with error",
+                      title=title, code=code)
             self.progress["value"] = 0
             self.status_label.configure(
                 text=f"Ошибка (код {code})",
@@ -1339,12 +1377,90 @@ class App(tk.Tk):
         if line_count > 6000:
             self.log_text.delete("1.0", f"{line_count - 5000}.0")
         self.log_text.configure(state="disabled")
+        if text.strip():
+            if text.startswith("[topond."):
+                LOGGER.info("%s", text)
+            else:
+                LOGGER.info("ui: %s", text)
+
+    def _ui_action(self, name: str, **fields) -> None:
+        log_action(LOGGER, f"ui.{name}", **fields)
+
+    def _bind_ui_logging(self) -> None:
+        self.bind_all("<ButtonRelease-1>", self._log_ui_click, add="+")
+        self.bind_all("<FocusOut>", self._log_ui_focus, add="+")
+        self.bind_all("<<ComboboxSelected>>", self._log_ui_combo, add="+")
+        self.bind_all("<<NotebookTabChanged>>", self._log_ui_tab, add="+")
+
+    @staticmethod
+    def _widget_label(widget: tk.Misc) -> str:
+        try:
+            return str(widget.cget("text"))
+        except tk.TclError:
+            pass
+        try:
+            return str(widget.cget("value"))
+        except tk.TclError:
+            pass
+        return ""
+
+    def _log_ui_click(self, event) -> None:
+        widget = event.widget
+        cls = widget.winfo_class()
+        if cls not in {
+            "TButton", "TCheckbutton", "TRadiobutton", "TCombobox",
+            "TNotebook", "Treeview", "TEntry", "TScale",
+        }:
+            return
+        fields = {"widget": cls, "label": self._widget_label(widget)}
+        try:
+            if cls in {"TCheckbutton", "TRadiobutton"}:
+                fields["checked"] = bool(widget.instate(["selected"]))
+            elif cls == "TCombobox":
+                fields["value"] = widget.get()
+            elif cls == "TNotebook":
+                fields["tab"] = widget.index("current")
+            elif cls == "Treeview":
+                fields["item"] = widget.identify_row(event.y)
+            elif cls == "TScale":
+                fields["value"] = widget.get()
+        except (tk.TclError, ValueError):
+            pass
+        self._ui_action("click", **fields)
+
+    def _log_ui_focus(self, event) -> None:
+        widget = event.widget
+        if widget.winfo_class() != "TEntry":
+            return
+        try:
+            value = widget.get()
+        except tk.TclError:
+            value = ""
+        self._ui_action("entry", value=value)
+
+    def _log_ui_combo(self, event) -> None:
+        widget = event.widget
+        try:
+            value = widget.get()
+        except (tk.TclError, AttributeError):
+            value = ""
+        self._ui_action("combobox", value=value,
+                        label=self._widget_label(widget))
+
+    def _log_ui_tab(self, event) -> None:
+        widget = event.widget
+        try:
+            tab = widget.index("current")
+        except (tk.TclError, ValueError):
+            tab = -1
+        self._ui_action("tab", tab=tab)
 
     def _on_stop(self) -> None:
         if not self.runner.running():
             self.stop_button.state(["disabled"])
             return
         self.stop_requested = True
+        log_action(LOGGER, "stop_requested", title=self.active_title)
         self._append_log("Запрошена остановка процесса…")
         self.runner.stop()
         self.stop_button.state(["disabled"])
@@ -1358,8 +1474,13 @@ class App(tk.Tk):
     def _force_kill(self) -> None:
         self.kill_job = None
         if self.runner.running():
+            log_action(LOGGER, "force_kill", title=self.active_title)
             self._append_log("Процесс не завершился, принудительное завершение.")
-            self.runner.kill()
+            try:
+                self.runner.kill()
+            except Exception as exc:
+                log_error(LOGGER, "GUI-E004", "failed to kill process", exc=exc,
+                          title=self.active_title)
 
     def open_last_output(self) -> None:
         target = self.last_output_dir
@@ -1388,6 +1509,8 @@ class App(tk.Tk):
 
     def report_callback_exception(self, exc, value, tb) -> None:
         text = "".join(traceback.format_exception(exc, value, tb))
+        LOGGER.error("code=GUI-E001 uncaught UI exception: %s: %s\n%s",
+                     exc.__name__, value, text.rstrip())
         if hasattr(self, "log_text"):
             self._append_log(text.rstrip())
         messagebox.showerror(
@@ -1397,6 +1520,7 @@ class App(tk.Tk):
         )
 
     def _on_close(self) -> None:
+        log_action(LOGGER, "close", running=self.runner.running())
         if self.runner.running():
             answer = messagebox.askyesno(
                 "Процесс выполняется",
@@ -1407,12 +1531,16 @@ class App(tk.Tk):
                 return
             self.runner.stop()
         self.closing = True
+        self.viewer_tab.stop_viewer(silent=True)
         if self.kill_job is not None:
             try:
                 self.after_cancel(self.kill_job)
             except tk.TclError:
                 pass
-        self.destroy()
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 class DedupTab(ttk.Frame):
@@ -1629,7 +1757,7 @@ class ExportTab(ttk.Frame):
         self.app = app
         self.input_var = tk.StringVar()
         self.outdir_var = tk.StringVar()
-        self.mode_var = tk.StringVar(value="raw")
+        self.mode_var = tk.StringVar(value="align")
         self.dummy_var = tk.StringVar(value="X")
         self.keep_duplicates_var = tk.BooleanVar(value=False)
         self.space_group_var = tk.StringVar()
@@ -1704,7 +1832,7 @@ class ExportTab(ttk.Frame):
         ).pack(side="left", padx=(0, 18))
         ttk.Radiobutton(
             coordinates,
-            text="Совместить с атомами (--align)",
+            text="Совместить с атомами (--align) — рекомендуется",
             variable=self.mode_var,
             value="align",
         ).pack(side="left")
@@ -1945,6 +2073,7 @@ class ExportTab(ttk.Frame):
                 encoding="utf-8",
                 errors="replace",
                 timeout=60,
+                env=_child_env(),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             messagebox.showerror(
@@ -2065,6 +2194,10 @@ class ExportTab(ttk.Frame):
     def _after_success(self) -> None:
         if self.last_outdir is not None:
             self.app.super_tab.suggest_indir(str(self.last_outdir))
+            self.app.viewer_tab.set_directory(
+                str(self.last_outdir),
+                announce=False,
+            )
             self.app.notebook.select(self.app.super_page)
 
 
@@ -2559,22 +2692,639 @@ class SupercellTab(ttk.Frame):
         if self.last_outdir is not None:
             self.app.last_output_dir = self.last_outdir
             self.app.open_button.state(["!disabled"])
+            self.app.viewer_tab.set_directory(
+                str(self.last_outdir),
+                announce=False,
+            )
+
+
+class ViewerTab(ttk.Frame):
+    DATASETS = [
+        ("auto", "Авто"),
+        ("base", "Базовая ячейка"),
+        ("symm", "Симметрия"),
+        ("supercell", "Суперячейка"),
+        ("symm_supercell", "Симметрия + суперячейка"),
+    ]
+
+    FILE_SPECS = {
+        "base": (
+            "cell.pdb",
+            "critical_points.pdb",
+            "crystal_BPs.pdb",
+            "calc_BPs.pdb",
+        ),
+        "symm": (
+            "cell.pdb",
+            "critical_points_symm.pdb",
+            "crystal_BPs_symm.pdb",
+            "calc_BPs_symm.pdb",
+        ),
+        "supercell": (
+            "cell_supercell.pdb",
+            "critical_points_supercell.pdb",
+            "crystal_BPs_supercell.pdb",
+            "calc_BPs_supercell.pdb",
+        ),
+        "symm_supercell": (
+            "cell_supercell.pdb",
+            "critical_points_symm_supercell.pdb",
+            "crystal_BPs_symm_supercell.pdb",
+            "calc_BPs_symm_supercell.pdb",
+        ),
+    }
+
+    def __init__(self, parent: tk.Misc, app: App) -> None:
+        super().__init__(parent, padding=14)
+        self.app = app
+        self.process: subprocess.Popen[str] | None = None
+        self.reader_thread: threading.Thread | None = None
+        self.poll_job: str | None = None
+        self.viewer_running = False
+        self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.dir_var = tk.StringVar()
+        self.dataset_var = tk.StringVar(value="Авто")
+        self.cell_var = tk.StringVar()
+        self.cp_var = tk.StringVar()
+        self.crystal_bp_var = tk.StringVar()
+        self.calc_bp_var = tk.StringVar()
+        self.topond_out_var = tk.StringVar()
+        self.title_var = tk.StringVar()
+        self.align_cp_var = tk.BooleanVar(value=True)
+        self.status_var = tk.StringVar(
+            value=(
+                "Выберите папку с PDB. Файлы можно указать вручную, "
+                "если автоматический поиск не подходит."
+            )
+        )
+
+        self.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            self,
+            text="Шаг 4. Просмотр структуры в JSmol",
+            style="Title.TLabel",
+        ).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(
+            self,
+            text=(
+                "Атомы показываются в CPK-стиле. Критические точки и "
+                "BondPaths рисуются плоскими точками; CP по умолчанию "
+                "совмещаются с атомами. Цвета, размеры и видимость слоёв "
+                "настраиваются в окне JSmol."
+            ),
+            style="Subtitle.TLabel",
+            wraplength=980,
+            justify="left",
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 12))
+
+        ttk.Label(self, text="Папка с PDB:").grid(
+            row=2, column=0, sticky="w", pady=4
+        )
+        self.dir_entry = ttk.Entry(self, textvariable=self.dir_var)
+        self.dir_entry.grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(8, 6), pady=4
+        )
+        self.dir_entry.bind("<Return>", lambda _event: self._detect())
+        ttk.Button(
+            self,
+            text="Обзор…",
+            command=self._browse_dir,
+        ).grid(row=2, column=3, pady=4)
+
+        ttk.Label(self, text="Набор файлов:").grid(
+            row=3, column=0, sticky="w", pady=4
+        )
+        self.dataset_combo = ttk.Combobox(
+            self,
+            textvariable=self.dataset_var,
+            values=[label for _key, label in self.DATASETS],
+            state="readonly",
+            width=28,
+        )
+        self.dataset_combo.grid(
+            row=3, column=1, sticky="w", padx=(8, 6), pady=4
+        )
+        self.dataset_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _event: self._detect(),
+        )
+        ttk.Button(
+            self,
+            text="Определить файлы",
+            command=self._detect,
+        ).grid(row=3, column=2, sticky="w", padx=(0, 6), pady=4)
+
+        files_frame = ttk.LabelFrame(self, text="Файлы PDB", padding=10)
+        files_frame.grid(
+            row=4, column=0, columnspan=4, sticky="ew", pady=(12, 6)
+        )
+        files_frame.columnconfigure(1, weight=1)
+
+        self._add_file_row(
+            files_frame,
+            0,
+            "Атомы / ячейка:",
+            self.cell_var,
+            "cell.pdb",
+        )
+        self._add_file_row(
+            files_frame,
+            1,
+            "Критические точки:",
+            self.cp_var,
+            "critical_points.pdb",
+        )
+        self._add_file_row(
+            files_frame,
+            2,
+            "BondPaths (crystal):",
+            self.crystal_bp_var,
+            "crystal_BPs.pdb",
+        )
+        self._add_file_row(
+            files_frame,
+            3,
+            "BondPaths (calc):",
+            self.calc_bp_var,
+            "calc_BPs.pdb",
+        )
+
+        controls = ttk.Frame(self)
+        controls.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 4))
+        self.launch_button = ttk.Button(
+            controls,
+            text="Открыть JSmol",
+            style="Run.TButton",
+            command=self._launch,
+        )
+        self.launch_button.pack(side="left", padx=(0, 8))
+        self.stop_button = ttk.Button(
+            controls,
+            text="Остановить",
+            command=self._stop,
+            state="disabled",
+        )
+        self.stop_button.pack(side="left")
+        ttk.Checkbutton(
+            controls,
+            text="Совместить CP с атомами",
+            variable=self.align_cp_var,
+            command=lambda: self._describe_files(announce=False),
+        ).pack(side="left", padx=(16, 0))
+
+        ttk.Label(
+            self,
+            textvariable=self.status_var,
+            style="Subtitle.TLabel",
+            wraplength=980,
+            justify="left",
+        ).grid(row=6, column=0, columnspan=4, sticky="w", pady=(8, 2))
+
+        self.after(250, self._poll)
+
+    def _add_file_row(
+        self,
+        parent: ttk.LabelFrame,
+        row: int,
+        label: str,
+        variable: tk.StringVar,
+        default_name: str,
+    ) -> None:
+        ttk.Label(parent, text=label).grid(
+            row=row, column=0, sticky="w", pady=3
+        )
+        ttk.Entry(parent, textvariable=variable).grid(
+            row=row, column=1, sticky="ew", padx=(8, 6), pady=3
+        )
+        ttk.Button(
+            parent,
+            text="Обзор…",
+            command=lambda v=variable, n=default_name: self._browse_file(v, n),
+        ).grid(row=row, column=2, pady=3)
+
+    def _dataset_key(self) -> str:
+        for key, label in self.DATASETS:
+            if label == self.dataset_var.get():
+                return key
+        return "auto"
+
+    def _browse_dir(self) -> None:
+        initial = dialog_initial_dir(self.dir_var.get())
+        path = filedialog.askdirectory(
+            title="Папка с PDB-файлами",
+            initialdir=str(initial),
+            parent=self,
+        )
+        if path:
+            self.dir_var.set(path)
+            self._detect()
+
+    def _browse_topond_out(self) -> None:
+        initial = dialog_initial_dir(self.dir_var.get())
+        path = filedialog.askopenfilename(
+            title="Выберите файл CP_BPs .out",
+            initialdir=str(initial),
+            filetypes=(("TOPOND .out", "*.out"), ("Все файлы", "*.*")),
+            parent=self,
+        )
+        if path:
+            self.topond_out_var.set(path)
+
+    def _browse_file(self, variable: tk.StringVar, default_name: str) -> None:
+        initial = dialog_initial_dir(self.dir_var.get())
+        initial_file = initial / default_name
+        path = filedialog.askopenfilename(
+            title="Выберите PDB-файл",
+            initialdir=str(initial),
+            initialfile=initial_file.name,
+            filetypes=[
+                ("PDB files", "*.pdb"),
+                ("All files", "*"),
+            ],
+            parent=self,
+        )
+        if path:
+            variable.set(path)
+
+    def set_directory(self, path: str, announce: bool = True) -> None:
+        text = str(path).strip()
+        if not text:
+            return
+        self.dir_var.set(text)
+        self._detect(announce=announce)
+
+    def _detect(self, announce: bool = True) -> None:
+        directory = resolve_user_path(self.dir_var.get())
+        if not directory.is_dir():
+            if announce:
+                messagebox.showerror(
+                    "Проверка папки",
+                    "Укажите существующую папку с PDB-файлами.",
+                    parent=self,
+                )
+            return
+
+        key = self._dataset_key()
+        if key == "auto":
+            key = self._autodetect_dataset(directory)
+        names = self.FILE_SPECS[key]
+        paths = [directory / name for name in names]
+        self.cell_var.set(str(paths[0]) if paths[0].is_file() else "")
+        self.cp_var.set(str(paths[1]) if paths[1].is_file() else "")
+        self.crystal_bp_var.set(str(paths[2]) if paths[2].is_file() else "")
+        self.calc_bp_var.set(str(paths[3]) if paths[3].is_file() else "")
+        for name in ("CP_BPs_dedup_final.out", "CP_BPs_dedup.out", "CP_BPs.out"):
+            p = directory / name
+            if p.is_file() and not self.topond_out_var.get().strip():
+                self.topond_out_var.set(str(p))
+                break
+        self._describe_files(announce)
+
+    def _autodetect_dataset(self, directory: Path) -> str:
+        checks = (
+            (
+                "symm_supercell",
+                (
+                    "critical_points_symm_supercell.pdb",
+                    "crystal_BPs_symm_supercell.pdb",
+                ),
+            ),
+            (
+                "supercell",
+                (
+                    "critical_points_supercell.pdb",
+                    "crystal_BPs_supercell.pdb",
+                ),
+            ),
+            (
+                "symm",
+                (
+                    "critical_points_symm.pdb",
+                    "crystal_BPs_symm.pdb",
+                ),
+            ),
+            (
+                "base",
+                (
+                    "critical_points.pdb",
+                    "crystal_BPs.pdb",
+                ),
+            ),
+        )
+        for key, names in checks:
+            if any((directory / name).is_file() for name in names):
+                return key
+        return "base"
+
+    def _describe_files(self, announce: bool = True) -> None:
+        cell = resolve_user_path(self.cell_var.get())
+        if not cell.is_file():
+            self.status_var.set(
+                "Не найден файл атомов/ячейки. Проверьте папку или "
+                "выберите cell.pdb (cell_supercell.pdb) вручную."
+            )
+            if announce:
+                self.app._append_log(
+                    "JSmol: файл атомов/ячейки не найден."
+                )
+            return
+
+        command = self._build_command()
+        if command is None:
+            self.status_var.set(
+                f"Найден файл атомов: {cell.name}. "
+                "Остальные файлы можно указать вручную."
+            )
+            return
+        command.append("--summary")
+
+        self.status_var.set("Проверка PDB-файлов…")
+        self.update_idletasks()
+        try:
+            result = subprocess.run(
+                command,
+                cwd=str(BASE_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                env=_child_env(),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.status_var.set(
+                f"Файлы выбраны, но проверить их не удалось: {exc}"
+            )
+            return
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip().splitlines()
+            message = detail[-1] if detail else "неизвестная ошибка"
+            self.status_var.set(f"Ошибка проверки файлов: {message}")
+            return
+        payload = None
+        for line in reversed(result.stdout.splitlines()):
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    payload = None
+                if payload is not None:
+                    break
+        if not isinstance(payload, dict):
+            self.status_var.set("Файлы выбраны. JSmol готов к запуску.")
+            return
+        counts = payload.get("counts", {})
+        parts = [
+            f"атомов: {counts.get('atoms', 0)}",
+            f"BCP: {counts.get('bcp', 0)}",
+            f"RCP: {counts.get('rcp', 0)}",
+            f"CCP: {counts.get('ccp', 0)}",
+            f"NCP: {counts.get('ncp', 0)}",
+            f"crystal BP: {counts.get('bp_crystal', 0)}",
+            f"calc BP: {counts.get('bp_calc', 0)}",
+        ]
+        align = payload.get("cpAlign") or {}
+        if align.get("enabled"):
+            parts.append(f"CP выровнено: {int(align.get('moved', 0) or 0)}")
+        self.status_var.set(" · ".join(parts))
+        if announce:
+            self.app._append_log(f"JSmol: {' · '.join(parts)}")
+
+    def _build_command(self) -> list[str] | None:
+        cell = self.cell_var.get().strip()
+        if not cell:
+            return None
+        command = [
+            worker_python(),
+            "-u",
+            str(VIEWER_SCRIPT),
+            "--cell",
+            cell,
+        ]
+        for option, text in (
+            ("--cp", self.cp_var.get()),
+            ("--crystal-bp", self.crystal_bp_var.get()),
+            ("--calc-bp", self.calc_bp_var.get()),
+            ("--topond-out", self.topond_out_var.get()),
+        ):
+            text = text.strip()
+            if text:
+                command.extend([option, text])
+        command.append(
+            "--align-cp" if self.align_cp_var.get() else "--no-align-cp"
+        )
+        return command
+
+    def _launch(self) -> None:
+        if not VIEWER_SCRIPT.is_file():
+            messagebox.showerror(
+                "JSmol",
+                f"Не найден модуль просмотра:\n{VIEWER_SCRIPT}",
+                parent=self,
+            )
+            return
+        if not self.cell_var.get().strip():
+            self._detect()
+            if not self.cell_var.get().strip():
+                messagebox.showerror(
+                    "Проверка параметров",
+                    "Не найден PDB-файл атомов/ячейки.",
+                    parent=self,
+                )
+                return
+        command = self._build_command()
+        if command is None:
+            messagebox.showerror(
+                "Проверка параметров",
+                "Не найден PDB-файл атомов/ячейки.",
+                parent=self,
+            )
+            return
+        for path in command[4:]:
+            if path.startswith("--"):
+                continue
+            if not resolve_user_path(path).is_file():
+                messagebox.showerror(
+                    "Проверка параметров",
+                    f"Файл не найден:\n{path}",
+                    parent=self,
+                )
+                return
+
+        if self.viewer_running:
+            answer = messagebox.askyesno(
+                "JSmol уже открыт",
+                "Закрыть текущее окно JSmol и открыть новое?",
+                parent=self,
+            )
+            if not answer:
+                return
+            self._stop()
+
+        kwargs: dict[str, object] = {}
+        if os.name != "nt":
+            kwargs["start_new_session"] = True
+        env = _child_env()
+        try:
+            process = subprocess.Popen(
+                command,
+                cwd=str(BASE_DIR),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+                **kwargs,
+            )
+        except OSError as exc:
+            log_error(LOGGER, "GUI-E002", "failed to launch viewer", exc=exc,
+                      command=" ".join(command))
+            messagebox.showerror(
+                "JSmol",
+                f"Не удалось запустить просмотрщик:\n{exc}",
+                parent=self,
+            )
+            return
+
+        log_action(LOGGER, "viewer_launch", pid=process.pid,
+                   command=" ".join(command))
+        self.process = process
+        self.viewer_running = True
+        self.launch_button.state(["disabled"])
+        self.stop_button.state(["!disabled"])
+        self.app._append_log("JSmol: запуск просмотрщика…")
+        self.status_var.set("JSmol загружается…")
+        self.reader_thread = threading.Thread(
+            target=self._read_output,
+            args=(process,),
+            daemon=True,
+        )
+        self.reader_thread.start()
+
+    def _read_output(self, process: subprocess.Popen[str]) -> None:
+        stream = process.stdout
+        if stream is not None:
+            try:
+                for line in stream:
+                    self.log_queue.put(("line", line.rstrip()))
+            except (OSError, ValueError):
+                pass
+        code = process.wait()
+        self.log_queue.put(("done", code))
+
+    def _poll(self) -> None:
+        try:
+            while True:
+                kind, value = self.log_queue.get_nowait()
+                if kind == "line":
+                    self._handle_line(str(value))
+                elif kind == "done":
+                    self._finish(int(value))
+        except queue.Empty:
+            pass
+        try:
+            self.poll_job = self.after(150, self._poll)
+        except tk.TclError:
+            self.poll_job = None
+
+    def _handle_line(self, text: str) -> None:
+        if not text:
+            return
+        if text.startswith("STATE "):
+            return
+        if text.startswith("VIEWER_READY "):
+            self.status_var.set("Окно JSmol открыто.")
+            self.app._append_log("JSmol: окно открыто.")
+            return
+        if text.startswith("SCREENSHOT ") or text.startswith("EVAL "):
+            return
+        if text.startswith("Загружено:"):
+            self.status_var.set(text)
+        elif text.startswith("Крупная ячейка:"):
+            self.status_var.set(text)
+        elif text.startswith("CP выровнены:"):
+            self.status_var.set(text)
+        elif text.startswith("ERROR"):
+            self.status_var.set(text)
+        self.app._append_log(f"JSmol: {text}")
+
+    def _finish(self, code: int) -> None:
+        if not self.viewer_running and self.process is None:
+            return
+        self.process = None
+        self.viewer_running = False
+        self.launch_button.state(["!disabled"])
+        self.stop_button.state(["disabled"])
+        if code == 0:
+            self.status_var.set("Окно JSmol закрыто.")
+            self.app._append_log("JSmol: окно закрыто.")
+        else:
+            self.status_var.set(f"JSmol завершился с кодом {code}.")
+            self.app._append_log(
+                f"JSmol: процесс завершился с кодом {code}."
+            )
+
+    def _stop(self) -> None:
+        self.stop_viewer(silent=False)
+
+    def stop_viewer(self, silent: bool = False) -> None:
+        process = self.process
+        if process is None:
+            return
+        if process.poll() is not None:
+            self.process = None
+            self.viewer_running = False
+            try:
+                self.launch_button.state(["!disabled"])
+                self.stop_button.state(["disabled"])
+            except tk.TclError:
+                pass
+            return
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        self.process = None
+        self.viewer_running = False
+        if not silent:
+            self.status_var.set("Окно JSmol остановлено.")
+            self.app._append_log("JSmol: просмотрщик остановлен.")
+        try:
+            self.launch_button.state(["!disabled"])
+            self.stop_button.state(["disabled"])
+        except tk.TclError:
+            pass
+
 
 
 def main() -> int:
+    setup("gui")
+    install_excepthook(LOGGER, "GUI-E001")
     has_fonts = _tk_has_unicode_fonts()
     if has_fonts is False and not os.environ.get(GUI_REEXEC_ENV):
         alternative = _find_unicode_gui_python()
         if alternative is not None:
+            log_action(LOGGER, "reexec", python=alternative)
             try:
                 _reexec_with_python(alternative)
             except OSError:
                 pass
     if has_fonts is False:
+        log_error(LOGGER, "GUI-E003", "no Unicode fonts available")
         return _report_font_problem()
+    log_action(LOGGER, "start", log_file=str(log_path()), pid=os.getpid())
     try:
         app = App()
     except tk.TclError as exc:
+        log_error(LOGGER, "GUI-E003", "cannot open GUI window", exc=exc)
         print(
             "ERROR: не удалось открыть графическое окно "
             f"(проверьте DISPLAY): {exc}",
@@ -2583,6 +3333,7 @@ def main() -> int:
         return 2
     _ensure_worker_python()
     app.mainloop()
+    log_action(LOGGER, "exit")
     return 0
 
 

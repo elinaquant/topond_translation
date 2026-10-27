@@ -65,6 +65,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from topond_logging import log_action, log_error, setup
+
 BOHR_TO_ANG = 0.529177210903
 
 # spacing (angstrom) of the dots that approximate a bond path segment
@@ -106,8 +108,11 @@ CP_COORD_RE = re.compile(
     r"COORD\(AU\)\s*\(X\s*Y\s*Z\)\s*:\s*"
     r"(\S+)\s+(\S+)\s+(\S+)"
 )
-CP_PROPS_RE = re.compile(r"PROPERTIES\s*\(RHO,GRHO,LAP\)\s*:\s*(\S+)")
+CP_PROPS_RE = re.compile(r"PROPERTIES\s*\(RHO,GRHO,LAP\)\s*:\s*(\S+)\s+(\S+)\s+(\S+)")
+CP_GK_RE = re.compile(r"KINETIC\s+ENERGY\s+DENSITIES\s*\(G,K\)\s*:\s*(\S+)\s+(\S+)")
+CP_VIRIAL_RE = re.compile(r"VIRIAL\s+DENSITY\s*:\s*(\S+)")
 CP_ELF_RE = re.compile(r"ELF\([^)]*\)\s*:\s*(\S+)")
+CP_ELLIP_RE = re.compile(r"ELLIPTICITY\s*:\s*(\S+)")
 CLUSTER_RE = re.compile(r"CLUSTER OF ATOMS AROUND THE CP")
 SEARCH_BOND_RE = re.compile(r"SEARCH OF BOND PATH ATTRACTORS")
 TERMINUS_RE = re.compile(
@@ -204,10 +209,17 @@ class CP:
     y: float
     z_: float
     rho: float | None = None
+    grho: float | None = None
+    lap: float | None = None
+    g: float | None = None
+    k: float | None = None
+    virial: float | None = None
     elf: float | None = None
+    ellipticity: float | None = None
     # first two rows of "CLUSTER OF ATOMS AROUND THE CP" (nearest nuclei)
     attractors: list[Atom] | None = None
     sym_op: int | None = None  # index of the space-group operation, if expanded
+    cell: int | None = None
     # full "CLUSTER OF ATOMS AROUND THE CP" table (usually 10 rows)
     cluster_atoms: list[Atom] | None = None
     # (3,-3) attractors explicitly listed in SEARCH OF BOND PATH ATTRACTORS
@@ -416,13 +428,14 @@ def _cluster_atom(row: re.Match) -> Atom:
 
 def _merge_cp_data(dst: CP, src: CP) -> None:
     """Merge two copies of the same CP without losing attractor data."""
-    if dst.rho is None:
+    if dst.rho is None and src.rho is not None:
         dst.rho = src.rho
-    if dst.elf is None:
-        dst.elf = src.elf
-    if dst.attractors is None:
+    for attr in ("grho", "lap", "g", "k", "virial", "elf", "ellipticity"):
+        if getattr(dst, attr) is None and getattr(src, attr) is not None:
+            setattr(dst, attr, getattr(src, attr))
+    if dst.attractors is None and src.attractors:
         dst.attractors = src.attractors
-    if dst.cluster_atoms is None:
+    if dst.cluster_atoms is None and src.cluster_atoms:
         dst.cluster_atoms = src.cluster_atoms
     if src.bp_attractors:
         existing = dst.bp_attractors or []
@@ -468,7 +481,13 @@ def parse_cps(text: str, keep_duplicates: bool = False) -> list[CP]:
         cp_type: tuple[int, int] | None = None
         coord: tuple[float, float, float] | None = None
         rho: float | None = None
+        grho: float | None = None
+        lap: float | None = None
+        g: float | None = None
+        k: float | None = None
+        virial: float | None = None
         elf: float | None = None
+        ellipticity: float | None = None
         cluster_atoms: list[Atom] = []
         bp_attractors: list[Attractor] = []
         missing: list[int] = []
@@ -517,14 +536,30 @@ def parse_cps(text: str, keep_duplicates: bool = False) -> list[CP]:
                         float(v) * BOHR_TO_ANG for v in m.groups()
                     )
                     continue
-            if rho is None:
-                m = CP_PROPS_RE.search(line)
-                if m:
-                    try:
-                        rho = float(m.group(1))
-                    except ValueError:
-                        rho = None
-                    continue
+            m = CP_PROPS_RE.search(line)
+            if m and rho is None:
+                try:
+                    rho = float(m.group(1))
+                    grho = float(m.group(2))
+                    lap = float(m.group(3))
+                except ValueError:
+                    pass
+                continue
+            m = CP_GK_RE.search(line)
+            if m and g is None:
+                try:
+                    g = float(m.group(1))
+                    k = float(m.group(2))
+                except ValueError:
+                    pass
+                continue
+            m = CP_VIRIAL_RE.search(line)
+            if m and virial is None:
+                try:
+                    virial = float(m.group(1))
+                except ValueError:
+                    virial = None
+                continue
             if elf is None:
                 m = CP_ELF_RE.search(line)
                 if m:
@@ -532,6 +567,14 @@ def parse_cps(text: str, keep_duplicates: bool = False) -> list[CP]:
                         elf = float(m.group(1))
                     except ValueError:
                         elf = None
+                    continue
+            if ellipticity is None:
+                m = CP_ELLIP_RE.search(line)
+                if m:
+                    try:
+                        ellipticity = float(m.group(1))
+                    except ValueError:
+                        ellipticity = None
                     continue
 
             if CLUSTER_RE.search(line):
@@ -601,7 +644,13 @@ def parse_cps(text: str, keep_duplicates: bool = False) -> list[CP]:
         cp = CP(
             num, cp_type, *coord,
             rho=rho,
+            grho=grho,
+            lap=lap,
+            g=g,
+            k=k,
+            virial=virial,
             elf=elf,
+            ellipticity=ellipticity,
             attractors=cluster_atoms[:2] or None,
             cluster_atoms=cluster_atoms or None,
             bp_attractors=bp_attractors or None,
@@ -1787,12 +1836,25 @@ def main(argv: list[str] | None = None) -> int:
                          "exit")
     ap.add_argument("--all-settings", action="store_true",
                     help="with --list-space-groups: list all 530 settings")
-    args = ap.parse_args(argv)
+    logger = setup("export")
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            log_error(logger, "EXP-E008", "invalid command-line arguments",
+                      argv=" ".join(sys.argv[1:] if argv is None else argv),
+                      exit_code=exc.code)
+        raise
+    log_action(logger, "start", input=str(args.input) if args.input else None,
+               outdir=str(args.outdir), wrap=args.wrap, align=args.align,
+               space_group=args.space_group, keep_duplicates=args.keep_duplicates)
 
     if args.list_space_groups:
         try:
             rows = space_group_table(all_settings=args.all_settings)
         except RuntimeError as exc:
+            log_error(logger, "EXP-E001", "failed to build space-group table",
+                      exc=exc)
             print(f"ERROR: {exc}", file=sys.stderr)
             return 2
         width = max(len(r[1]) for r in rows)
@@ -1801,9 +1863,13 @@ def main(argv: list[str] | None = None) -> int:
             note = f"  [{choice}]" if choice else ""
             print(f"  {number:3d}    {symbol:<{width}}  {hall:4d}  "
                   f"{n_ops:3d}{note}")
+        log_action(logger, "space_groups", rows=len(rows),
+                   all_settings=args.all_settings)
         return 0
 
     if not 0.0 <= args.bp_angle <= 180.0:
+        log_error(logger, "EXP-E002", "--bp-angle must be between 0 and 180",
+                  bp_angle=args.bp_angle)
         print("ERROR: --bp-angle must be between 0 and 180 degrees",
               file=sys.stderr)
         return 2
@@ -1811,14 +1877,18 @@ def main(argv: list[str] | None = None) -> int:
         args.symmetry_image = "shift"
 
     if args.input is None:
+        log_error(logger, "EXP-E003", "input file is required")
         print("ERROR: input file is required", file=sys.stderr)
         return 2
     if not args.input.is_file():
+        log_error(logger, "EXP-E003", "input file not found", input=str(args.input))
         print(f"ERROR: input file not found: {args.input}", file=sys.stderr)
         return 2
     try:
         text = args.input.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
+        log_error(logger, "EXP-E004", "cannot read input", exc=exc,
+                  input=str(args.input))
         print(f"ERROR: cannot read {args.input}: {exc}", file=sys.stderr)
         return 2
 
@@ -2119,8 +2189,10 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     for msg in errors:
+        log_error(logger, "EXP-E005", "export error", detail=msg)
         print(msg, file=sys.stderr)
     for msg in warnings:
+        logger.warning("code=EXP-W001 %s", msg)
         print(msg, file=sys.stderr)
 
     summary_path = outdir / "summary.txt"
@@ -2130,11 +2202,22 @@ def main(argv: list[str] | None = None) -> int:
                             align_note=align_note,
                             bond_note=bond_note,
                             sym_note=sym_note)
-    summary_path.write_text(summary, encoding="utf-8")
+    try:
+        summary_path.write_text(summary, encoding="utf-8")
+    except OSError as exc:
+        log_error(logger, "EXP-E006", "cannot write summary", exc=exc,
+                  summary=str(summary_path))
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
+    log_action(logger, "written", outdir=str(outdir), files=len(files),
+               cps=len(cps), atoms=len(atoms), errors=len(errors),
+               warnings=len(warnings), summary=str(summary_path))
     print(summary, end="")
 
     if not cps:
+        log_error(logger, "EXP-E007", "no critical points found",
+                  input=str(args.input))
         return 1
     return 0
 

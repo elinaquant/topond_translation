@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Sequence
 
+from topond_logging import log_action, log_error, setup
+
 EPS = 1e-9
 DEFAULT_CENTER_FRAC = (0.5, 0.5, 0.5)
 DEFAULT_RANGE_FRAC = (-0.5, 0.5, -0.5, 0.5, -0.5, 0.5)
@@ -717,13 +719,23 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_parser()
-    args = parser.parse_args(argv)
-    _validate_args(parser, args)
+    logger = setup("supercell")
+    try:
+        args = parser.parse_args(argv)
+        _validate_args(parser, args)
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            log_error(logger, "SUP-E005", "invalid command-line arguments",
+                      argv=" ".join(sys.argv[1:] if argv is None else argv),
+                      exit_code=exc.code)
+        raise
 
     indir = Path(args.indir)
     if args.outdir is None:
         args.outdir = indir.with_name(indir.name + "_supercell")
     outdir = Path(args.outdir)
+    log_action(logger, "start", indir=str(indir), outdir=str(outdir),
+               source=args.source)
 
     atom_path, cps_path, crystal_path, calc_path = _input_paths(
         indir, args.source
@@ -732,6 +744,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     missing = [path for path in required if not path.is_file()]
     if missing:
         for path in missing:
+            log_error(logger, "SUP-E001", "input file not found", path=path)
             print(f"ERROR: input file not found: {path}", file=sys.stderr)
         return 1
 
@@ -742,9 +755,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         calc_lattice, calc_global, calc_groups = read_bonds(calc_path)
         supercell = build_supercell(lattice, args)
     except (OSError, ValueError) as exc:
+        log_error(logger, "SUP-E002", "failed to read input or build supercell",
+                  exc=exc, indir=str(indir))
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    log_action(logger, "parsed", atoms=len(atoms), cps=len(cps),
+               crystal_bonds=len(crystal_groups), calc_bonds=len(calc_groups))
     warnings: list[str] = []
     for path, other in (
         (cps_path, cps_lattice),
@@ -771,7 +788,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             "box edges may cut molecules and bond paths"
         )
 
-    outdir.mkdir(parents=True, exist_ok=True)
+    for message in warnings:
+        logger.warning("code=SUP-W001 %s", message)
+
+    try:
+        outdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log_error(logger, "SUP-E003", "failed to create output directory",
+                  exc=exc, outdir=str(outdir))
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     header = _header_lines(supercell, args.source)
 
     atom_out = outdir / "cell_supercell.pdb"
@@ -808,8 +834,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         "calc": calc_out,
     }
     summary = _summary_text(args, supercell, paths, counts, warnings)
-    summary_out.write_text(summary, encoding="utf-8")
+    try:
+        summary_out.write_text(summary, encoding="utf-8")
+    except OSError as exc:
+        log_error(logger, "SUP-E004", "failed to write summary",
+                  exc=exc, summary=str(summary_out))
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
+    log_action(logger, "written", outdir=str(outdir),
+               atoms=atom_count, cps=cps_count,
+               crystal_lines=crystal_lines, calc_lines=calc_lines,
+               warnings=len(warnings), summary=str(summary_out))
     print(summary)
     print(f"Summary written to: {summary_out}")
     return 0
