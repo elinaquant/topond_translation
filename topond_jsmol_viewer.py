@@ -948,9 +948,9 @@ def _run_qt(
 ) -> int:
     try:
         from PySide6.QtCore import QTimer, QUrl, Qt
-        from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineSettings
+        from PySide6.QtWebEngineCore import QWebEngineNewWindowRequest, QWebEnginePage, QWebEngineSettings
         from PySide6.QtWebEngineWidgets import QWebEngineView
-        from PySide6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication, QMainWindow
     except Exception as exc:
         print(
             "ERROR: для окна JSmol нужен PySide6 с QtWebEngine. "
@@ -1023,6 +1023,50 @@ def _run_qt(
         print(f"ERROR: обработчик загрузок недоступен: {exc}", file=sys.stderr, flush=True)
     view.setWindowTitle(f"JSmol — {title}")
     view.resize(1280, 860)
+
+    def _handle_new_window(request: QWebEngineNewWindowRequest) -> None:
+        try:
+            new_view = QWebEngineView()
+            new_page = LoggingPage(new_view)
+            new_view.setPage(new_page)
+            new_win = QMainWindow()
+            new_win.setWindowTitle("Предпросмотр JSmol")
+            new_win.setCentralWidget(new_view)
+            try:
+                request.setView(new_view)
+            except AttributeError:
+                pass
+            try:
+                url = request.requestedUrl()
+            except AttributeError:
+                url = None
+            if url is not None:
+                url_str = url.toString() if hasattr(url, "toString") else str(url)
+                if url_str.startswith("data:"):
+                    html = (
+                        "<!doctype html><html><head><meta charset='utf-8'>"
+                        "<style>body{margin:0;background:#ccffcc;"
+                        "display:flex;justify-content:center;align-items:center;"
+                        "height:100vh;}img{display:block;max-width:100vw;"
+                        "max-height:100vh;object-fit:contain;}</style></head>"
+                        "<body><img src='" + url_str + "' alt='Предпросмотр'></body></html>"
+                    )
+                    new_view.setHtml(html)
+                else:
+                    new_view.load(url)
+            new_win.show()
+            try:
+                request.accept()
+            except AttributeError:
+                pass
+        except Exception as exc:
+            log_error(LOGGER, "VIEW-E007", "new window handler failed", exc=exc)
+            try:
+                request.reject()
+            except AttributeError:
+                pass
+
+    page.newWindowRequested.connect(_handle_new_window)
 
     settings = view.settings()
     settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptEnabled, True)

@@ -1406,7 +1406,12 @@ class App(tk.Tk):
 
     def _log_ui_click(self, event) -> None:
         widget = event.widget
-        cls = widget.winfo_class()
+        try:
+            if not widget.winfo_exists():
+                return
+            cls = widget.winfo_class()
+        except (tk.TclError, AttributeError):
+            return
         if cls not in {
             "TButton", "TCheckbutton", "TRadiobutton", "TCombobox",
             "TNotebook", "Treeview", "TEntry", "TScale",
@@ -1430,7 +1435,12 @@ class App(tk.Tk):
 
     def _log_ui_focus(self, event) -> None:
         widget = event.widget
-        if widget.winfo_class() != "TEntry":
+        try:
+            if not widget.winfo_exists():
+                return
+            if widget.winfo_class() != "TEntry":
+                return
+        except (tk.TclError, AttributeError):
             return
         try:
             value = widget.get()
